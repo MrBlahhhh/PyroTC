@@ -92,6 +92,7 @@ float battV = 0;
 
 bool dirty = true;
 int lastShownTemp = -9999;
+bool lastFlash = false;
 unsigned long lastTempMs = 0, lastBatMs = 0, lastUiMs = 0, capturedFlashUntil = 0;
 
 // touch edge detect
@@ -284,6 +285,20 @@ static void drawRecord() {
 
 static void redraw() { if (mode == SELECT) drawSelect(); else drawRecord(); }
 
+// Repaint ONLY the live-temp text (no full-screen clear -> no flicker).
+static void updateTempRegion() {
+  if (mode == SELECT) {
+    gfx->fillRect(80, 12, 80, 26, C_BG);
+    if (tcOk && lastFault == 0 && !isnan(lastTempC)) {
+      char b[10]; snprintf(b, sizeof(b), "%d%s", (int)lroundf(toShow(lastTempC)), UNITS_FAHRENHEIT ? "F" : "C");
+      centerText(b, 16, 2, C_AMBER);
+    } else centerText("SELECT TIRE", 20, 1, C_MUTED);
+  } else {
+    gfx->fillRect(46, 42, 148, 54, C_BG);
+    drawLiveTempBig(46);
+  }
+}
+
 static void handleTap(int x, int y) {
   if (mode == SELECT) {
     if (inRect(x, y, 40, 40, 72, 72)) { selTire = 0; mode = RECORD; dirty = true; }
@@ -364,11 +379,15 @@ void loop() {
 
   serviceBuzzer();
 
-  // redraw on change or when the live number changes
+  // Full redraw only on state/mode change; otherwise repaint just the temp region.
+  bool flashNow = (now < capturedFlashUntil);
   int shownTemp = (int)lroundf(toShow(lastTempC));
-  if (dirty || shownTemp != lastShownTemp || now < capturedFlashUntil || (now - lastUiMs > 400)) {
-    lastUiMs = now; lastShownTemp = shownTemp; dirty = false;
+  if (dirty) {
     redraw();
+    dirty = false; lastShownTemp = shownTemp; lastFlash = flashNow;
+  } else if (shownTemp != lastShownTemp || flashNow != lastFlash) {
+    updateTempRegion();
+    lastShownTemp = shownTemp; lastFlash = flashNow;
   }
   delay(5);
 }
