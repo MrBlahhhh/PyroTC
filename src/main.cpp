@@ -92,8 +92,7 @@ float battV = 0;
 
 bool dirty = true;
 int lastShownTemp = -9999;
-bool lastFlash = false;
-unsigned long lastTempMs = 0, lastBatMs = 0, lastUiMs = 0, capturedFlashUntil = 0;
+unsigned long lastTempMs = 0, lastBatMs = 0;
 
 // touch edge detect
 bool touchWasDown = false;
@@ -198,7 +197,6 @@ static void doRecord() {
   for (int s = 0; s < 3; s++) {
     if (isnan(temps[selTire][s])) {
       temps[selTire][s] = lastTempC;
-      capturedFlashUntil = millis() + 500;
       beep(1, 90, 0);
       notifyState(); dirty = true;
       return;
@@ -224,11 +222,30 @@ static void textIn(const char* s, int cx, int cy, uint8_t size, uint16_t color) 
   gfx->setCursor(cx - w / 2, cy - h / 2); gfx->print(s);
 }
 
-static void drawLiveTempBig(int y) {
-  if (millis() < capturedFlashUntil) { centerText("CAPTURED", y, 3, C_GREEN); return; }
-  if (!tcOk || lastFault != 0 || isnan(lastTempC)) { centerText("FAULT", y - 4, 4, C_RED); return; }
-  char b[8]; snprintf(b, sizeof(b), "%d", (int)lroundf(toShow(lastTempC)));
-  centerText(b, y, 6, C_TEXT);
+// RECORD-screen slot geometry (3 blocks across the wide middle band)
+static const int SLOT_Y = 54, SLOT_H = 64, SLOT_W = 58;
+static const int SLOT_X[3] = {25, 91, 157};
+
+// Draw one O/M/I block. The next-to-fill block shows the LIVE temp in red;
+// a captured block shows its stored value in green; others show "--".
+static void drawSlot(int s, int nextEmpty) {
+  int bx = SLOT_X[s], by = SLOT_Y, bw = SLOT_W, bh = SLOT_H;
+  bool filled = !isnan(temps[selTire][s]);
+  bool isNext = (s == nextEmpty);
+  uint16_t border = filled ? C_GREEN : (isNext ? C_RED : C_MUTED);
+  gfx->fillRect(bx + 2, by + 2, bw - 4, bh - 4, C_BG);   // clear interior only
+  gfx->drawRoundRect(bx, by, bw, bh, 8, border);
+  textIn(SLOT[s], bx + bw / 2, by + 14, 1, C_MUTED);
+  char v[6]; uint16_t vc;
+  if (filled) {
+    snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(temps[selTire][s]))); vc = C_GREEN;
+  } else if (isNext) {
+    vc = C_RED;
+    if (tcOk && lastFault == 0 && !isnan(lastTempC))
+      snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(lastTempC)));
+    else snprintf(v, sizeof(v), "--");
+  } else { snprintf(v, sizeof(v), "--"); vc = C_MUTED; }
+  textIn(v, bx + bw / 2, by + 42, 3, vc);
 }
 
 static void drawSelect() {
@@ -256,31 +273,20 @@ static void drawSelect() {
 static void drawRecord() {
   gfx->fillScreen(C_BG);
   gfx->drawCircle(120, 120, 116, C_MUTED);
-  centerText(TIRE_LONG[selTire], 24, 2, C_AMBER);
-  drawLiveTempBig(46);
+  centerText(TIRE_LONG[selTire], 18, 2, C_AMBER);
 
-  // O/M/I slots (near vertical center where the circle is widest)
   int nextEmpty = -1;
   for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
-  const int sx[3] = {19, 89, 159};
-  for (int s = 0; s < 3; s++) {
-    uint16_t border = (s == nextEmpty) ? C_AMBER : C_MUTED;
-    gfx->drawRoundRect(sx[s], 100, 62, 32, 6, border);
-    textIn(SLOT[s], sx[s] + 11, 116, 1, C_MUTED);
-    char v[6];
-    if (isnan(temps[selTire][s])) snprintf(v, sizeof(v), "--");
-    else snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(temps[selTire][s])));
-    textIn(v, sx[s] + 40, 116, 2, C_TEXT);
-  }
+  for (int s = 0; s < 3; s++) drawSlot(s, nextEmpty);
 
-  // RECORD button
-  gfx->fillRoundRect(30, 138, 180, 36, 10, C_AMBER);
-  textIn("RECORD", 120, 156, 3, 0x1A03);
+  // big RECORD button
+  gfx->fillRoundRect(26, 124, 188, 56, 12, C_AMBER);
+  textIn("RECORD", 120, 152, 4, 0x1A03);
   // CLEAR / BACK
-  gfx->drawRoundRect(44, 180, 68, 24, 6, C_RED);
-  textIn("CLEAR", 78, 192, 2, C_RED);
-  gfx->drawRoundRect(128, 180, 68, 24, 6, C_MUTED);
-  textIn("BACK", 162, 192, 2, C_MUTED);
+  gfx->drawRoundRect(46, 186, 68, 22, 6, C_RED);
+  textIn("CLEAR", 80, 197, 2, C_RED);
+  gfx->drawRoundRect(126, 186, 68, 22, 6, C_MUTED);
+  textIn("BACK", 160, 197, 2, C_MUTED);
 }
 
 static void redraw() { if (mode == SELECT) drawSelect(); else drawRecord(); }
@@ -294,8 +300,9 @@ static void updateTempRegion() {
       centerText(b, 16, 2, C_AMBER);
     } else centerText("SELECT TIRE", 20, 1, C_MUTED);
   } else {
-    gfx->fillRect(46, 42, 148, 54, C_BG);
-    drawLiveTempBig(46);
+    int nextEmpty = -1;
+    for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
+    if (nextEmpty >= 0) drawSlot(nextEmpty, nextEmpty);
   }
 }
 
@@ -306,9 +313,9 @@ static void handleTap(int x, int y) {
     else if (inRect(x, y, 40, 128, 72, 72)) { selTire = 2; mode = RECORD; dirty = true; }
     else if (inRect(x, y, 128, 128, 72, 72)) { selTire = 3; mode = RECORD; dirty = true; }
   } else {
-    if (inRect(x, y, 30, 138, 180, 36)) doRecord();
-    else if (inRect(x, y, 44, 180, 68, 24)) doClear();
-    else if (inRect(x, y, 128, 180, 68, 24)) { mode = SELECT; dirty = true; }
+    if (inRect(x, y, 26, 124, 188, 56)) doRecord();
+    else if (inRect(x, y, 46, 186, 68, 22)) doClear();
+    else if (inRect(x, y, 126, 186, 68, 22)) { mode = SELECT; dirty = true; }
   }
 }
 
@@ -379,15 +386,14 @@ void loop() {
 
   serviceBuzzer();
 
-  // Full redraw only on state/mode change; otherwise repaint just the temp region.
-  bool flashNow = (now < capturedFlashUntil);
+  // Full redraw only on state/mode change; otherwise repaint just the live block.
   int shownTemp = (int)lroundf(toShow(lastTempC));
   if (dirty) {
     redraw();
-    dirty = false; lastShownTemp = shownTemp; lastFlash = flashNow;
-  } else if (shownTemp != lastShownTemp || flashNow != lastFlash) {
+    dirty = false; lastShownTemp = shownTemp;
+  } else if (shownTemp != lastShownTemp) {
     updateTempRegion();
-    lastShownTemp = shownTemp; lastFlash = flashNow;
+    lastShownTemp = shownTemp;
   }
   delay(5);
 }
