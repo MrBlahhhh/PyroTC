@@ -22,6 +22,7 @@
 #include <Arduino_GFX_Library.h>
 #include <max6675.h>
 #include <NimBLEDevice.h>
+#include <string>
 
 // display (fixed)
 #define LCD_DC 8
@@ -64,6 +65,19 @@
 #define SVC_UUID     "a1b20001-7a9c-4b1e-9d3a-2f6c8e5d4c30"
 #define CH_TEMP_UUID "a1b20002-7a9c-4b1e-9d3a-2f6c8e5d4c30"
 #define CH_STATE_UUID "a1b20003-7a9c-4b1e-9d3a-2f6c8e5d4c30"
+#define CH_PRESS_UUID "a1b20004-7a9c-4b1e-9d3a-2f6c8e5d4c30"
+
+// ---- TPMS (generic BLE sensors) ----
+// Fill with YOUR sensors' BLE addresses (lowercase) in wheel order LF,RF,LR,RR.
+// Build once with SCAN_DUMP 1 and watch Serial @115200 to discover addresses + bytes.
+#define SCAN_DUMP 0
+#define TPMS_STALE_MS 90000UL   // a wheel silent this long drops its indicator
+static const char* TPMS_MAC[4] = {
+  "00:00:00:00:00:00",  // LF
+  "00:00:00:00:00:00",  // RF
+  "00:00:00:00:00:00",  // LR
+  "00:00:00:00:00:00",  // RR
+};
 
 #define C_BG    0x0000
 #define C_TEXT  0xFFFF
@@ -72,6 +86,7 @@
 #define C_RED   0xFAC9
 #define C_MUTED 0x7C32
 #define C_PANEL 0x18E3
+#define C_TPMSBG 0x02D6   // has-TPMS-data wheel background (teal/blue)
 
 Arduino_DataBus* bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX* gfx = new Arduino_GC9A01(bus, LCD_RST, 1, true);
@@ -81,6 +96,11 @@ MAX6675 maxtc(PIN_TC_SCK, PIN_TC_CS, PIN_TC_SDO);
 
 NimBLECharacteristic* chTemp = nullptr;
 NimBLECharacteristic* chState = nullptr;
+NimBLECharacteristic* chPress = nullptr;
+volatile float tpmsPsi[4]      = {NAN, NAN, NAN, NAN};   // LF,RF,LR,RR
+volatile float tpmsTempC[4]    = {NAN, NAN, NAN, NAN};
+volatile uint32_t tpmsLastMs[4]= {0, 0, 0, 0};
+volatile bool pressDirty = false;
 volatile bool bleConnected = false;
 volatile bool needStateSync = false;
 
@@ -173,6 +193,60 @@ static void notifyState() {
   chState->setValue(buf, 24); if (bleConnected) chState->notify();
 #endif
 }
+
+// ---------- TPMS (BLE scan of generic wheel sensors) ----------
+static inline bool hasTpms(int w) {
+  return tpmsLastMs[w] != 0 && (millis() - tpmsLastMs[w]) < TPMS_STALE_MS;
+}
+
+static int wheelForAddr(const std::string& addr) {
+  for (int w = 0; w < 4; w++) if (addr == TPMS_MAC[w]) return w;
+  return -1;
+}
+
+// Decode PSI + degC from a sensor's advertising manufacturer data.
+// *** ADJUST to match your sensor *** — run SCAN_DUMP, capture a sample, map the bytes.
+// Default below matches the common cheap "BLE TPMS": [00 01][6-byte id][status]
+// [pressure u32 LE = Pa][temp i32 LE = 0.01 degC][batt][alarm].
+static bool decodeTpms(const uint8_t* d, size_t n, float& psi, float& tempC) {
+  if (n < 18) return false;
+  uint32_t pa  = (uint32_t)d[8]  | ((uint32_t)d[9] << 8)  | ((uint32_t)d[10] << 16) | ((uint32_t)d[11] << 24);
+  int32_t  tcc = (int32_t)((uint32_t)d[12] | ((uint32_t)d[13] << 8) | ((uint32_t)d[14] << 16) | ((uint32_t)d[15] << 24));
+  psi   = pa * 0.000145038f;   // Pa -> psi
+  tempC = tcc / 100.0f;        // 0.01 degC -> degC
+  if (psi < 0 || psi > 120 || tempC < -40 || tempC > 150) return false;  // sanity gate
+  return true;
+}
+
+static void notifyPressures() {
+#if ENABLE_BLE
+  uint8_t buf[32];
+  for (int w = 0; w < 4; w++) { float p = tpmsPsi[w];   memcpy(buf + w * 4,      &p, 4); }
+  for (int w = 0; w < 4; w++) { float t = tpmsTempC[w]; memcpy(buf + 16 + w * 4, &t, 4); }
+  chPress->setValue(buf, 32); if (bleConnected) chPress->notify();
+#endif
+}
+
+#if ENABLE_BLE
+class ScanCb : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    std::string addr = dev->getAddress().toString();
+    std::string md = dev->getManufacturerData();
+#if SCAN_DUMP
+    Serial.printf("ADV %s rssi=%d name=%s mfg=", addr.c_str(), dev->getRSSI(), dev->getName().c_str());
+    for (size_t i = 0; i < md.size(); i++) Serial.printf("%02x", (uint8_t)md[i]);
+    Serial.println();
+#endif
+    int w = wheelForAddr(addr);
+    if (w < 0) return;
+    float psi, tc;
+    if (decodeTpms((const uint8_t*)md.data(), md.size(), psi, tc)) {
+      tpmsPsi[w] = psi; tpmsTempC[w] = tc; tpmsLastMs[w] = millis();
+      pressDirty = true;
+    }
+  }
+};
+#endif
 
 // ---------- touch (CST816S) ----------
 static bool readTouch(int& x, int& y) {
@@ -314,11 +388,16 @@ static void drawSelect() {
   for (int t = 0; t < 4; t++) {
     int n = filledCount(t);
     uint16_t border = (n == 3) ? C_GREEN : (n > 0 ? C_AMBER : C_MUTED);
-    gfx->fillRoundRect(bx[t], by[t], 72, 72, 10, C_PANEL);
+    bool tp = hasTpms(t);
+    gfx->fillRoundRect(bx[t], by[t], 72, 72, 10, tp ? C_TPMSBG : C_PANEL);
     gfx->drawRoundRect(bx[t], by[t], 72, 72, 10, border);
-    textIn(TIRE_SHORT[t], bx[t] + 36, by[t] + 27, 3, C_TEXT);
+    if (tp && !isnan(tpmsPsi[t])) {
+      char p[8]; snprintf(p, sizeof(p), "%dp", (int)lroundf(tpmsPsi[t]));
+      textIn(p, bx[t] + 36, by[t] + 11, 1, C_TEXT);
+    }
+    textIn(TIRE_SHORT[t], bx[t] + 36, by[t] + 30, 3, C_TEXT);
     char c[6]; snprintf(c, sizeof(c), "%d/3", n);
-    textIn(c, bx[t] + 36, by[t] + 52, 2, border);
+    textIn(c, bx[t] + 36, by[t] + 54, 2, border);
   }
 }
 
@@ -399,12 +478,24 @@ void setup() {
   NimBLEService* svc = server->createService(SVC_UUID);
   chTemp = svc->createCharacteristic(CH_TEMP_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   chState = svc->createCharacteristic(CH_STATE_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  chPress = svc->createCharacteristic(CH_PRESS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->enableScanResponse(true);
   adv->start();
-  Serial.println("PyroTC ready, advertising.");
+
+  // Observer: continuously scan for the wheel TPMS sensors while still advertising.
+  static ScanCb scanCb;
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&scanCb, false);
+  scan->setActiveScan(true);
+  scan->setInterval(160);            // 0.625ms units (~100ms)
+  scan->setWindow(160);
+  scan->setDuplicateFilter(false);   // keep hearing each sensor to refresh freshness
+  scan->start(0, false);             // 0 = scan continuously
+  notifyPressures();                 // seed PRESS read value (all NaN until sensors heard)
+  Serial.println("PyroTC ready, advertising + TPMS scan.");
 #else
   Serial.println("PyroTC ready, BLE DISABLED (isolation build).");
 #endif
@@ -434,6 +525,16 @@ void loop() {
     }
   }
   if (needStateSync) { needStateSync = false; notifyState(); }
+  if (pressDirty) { pressDirty = false; notifyPressures(); }
+
+  // repaint SELECT when a wheel gains TPMS data or it goes stale
+  static uint8_t lastTpmsMask = 0xFF;
+  uint8_t tmask = 0;
+  for (int w = 0; w < 4; w++) if (hasTpms(w)) tmask |= (1 << w);
+  if (tmask != lastTpmsMask) {
+    lastTpmsMask = tmask;
+    if (mode == SELECT) dirty = true;
+  }
 
   int tx, ty;
   bool down = readTouch(tx, ty);
