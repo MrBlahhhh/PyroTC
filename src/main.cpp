@@ -15,6 +15,12 @@
  * TEMP  …0002 (READ,NOTIFY ~4Hz): float32 LE degC + uint8 fault   (live probe temp)
  * STATE …0003 (READ,NOTIFY on change): 12 × int16 LE deci-degC, order
  * LF[O,M,I], RF[O,M,I], LR[O,M,I], RR[O,M,I]; -32768 = empty slot
+ *
+ * TPMS: Tesla Model 3/Y (all gens) + Model S/X (2021+) BLE sensors.
+ * Sensors advertise as "tsTPMS" with manufacturer data containing 0x2B 0x02 payload.
+ * Decode based on cunzulatu/Tesla_BLE_TPMS — see decodeTeslaTpms() below.
+ * PRESS characteristic publishes 4xfloat PSI + 4xfloat degC (or NaN until heard).
+ * Build once with SCAN_DUMP 1 and check Serial @115200 to discover your 4 MACs.
  */
 
 #include <Arduino.h>
@@ -47,17 +53,10 @@
 
 #define ENABLE_BLE 1   // set 0 to build with NO BLE (isolation test)
 
-// battery indicator (top-right). The board charges the cell but does NOT route a
-// charge-status line to the MCU, so charging is inferred from pack voltage. If you
-// wire the charger's CHRG/STAT pad to a GPIO (open-drain, low = charging), set
-// PIN_CHRG to that pin for exact detection.
 #define PIN_CHRG -1
 #define CHG_V_THRESH 4.15f
 
 #define UNITS_FAHRENHEIT 1
-// Touch orientation for display rotation 1 (90°). If taps land wrong, adjust these
-// three knobs (they cover all 8 orientations). For rotation 3 instead, use
-// SWAP_XY 1 / FLIP_X 1 / FLIP_Y 0.
 #define TOUCH_SWAP_XY 1
 #define TOUCH_FLIP_X 0
 #define TOUCH_FLIP_Y 1
@@ -67,17 +66,40 @@
 #define CH_STATE_UUID "a1b20003-7a9c-4b1e-9d3a-2f6c8e5d4c30"
 #define CH_PRESS_UUID "a1b20004-7a9c-4b1e-9d3a-2f6c8e5d4c30"
 
-// ---- TPMS (generic BLE sensors) ----
-// Fill with YOUR sensors' BLE addresses (lowercase) in wheel order LF,RF,LR,RR.
-// Build once with SCAN_DUMP 1 and watch Serial @115200 to discover addresses + bytes.
+// ---- TPMS (Tesla BLE sensors) ----
+// Tesla Model 3/Y (all gens) + Model S/X (2021+) BLE sensors.
+// Sensors advertise as "tsTPMS" with manufacturer data containing 0x2B 0x02
+// payload marker. Build once with SCAN_DUMP 1 and watch Serial @115200 to
+// discover your four sensor MAC addresses.
+//
+// Decode (from cunzulatu/Tesla_BLE_TPMS, MIT license):
+//   Payload at 0x2B 0x02 marker:
+//     [0x2B] [0x02] [?] [?] [type] [press_lo] [press_hi] [temp] [batt_lo] [batt_hi]
+//     type < 0x05 -> sleep mode (no data)
+//     Pressure: ((uint16 LE @ +5) - 100) / 7 = PSI
+//     Temperature: (uint8 @ +7) - 1 = degF
 #define SCAN_DUMP 0
-#define TPMS_STALE_MS 90000UL   // a wheel silent this long drops its indicator
+#define TPMS_STALE_MS 90000UL
 static const char* TPMS_MAC[4] = {
   "00:00:00:00:00:00",  // LF
   "00:00:00:00:00:00",  // RF
   "00:00:00:00:00:00",  // LR
   "00:00:00:00:00:00",  // RR
 };
+
+// ----- Thread-safe TPMS state -----
+// The NimBLE scan callback runs in a different FreeRTOS task than loop().
+// All access to these arrays is protected by tpmsLock.
+static portMUX_TYPE tpmsLock = portMUX_INITIALIZER_UNLOCKED;
+static float    tpmsPsi[4]     = {NAN, NAN, NAN, NAN};
+static float    tpmsTempC[4]   = {NAN, NAN, NAN, NAN};
+static uint32_t tpmsLastMs[4]  = {0, 0, 0, 0};
+static bool     pressDirty      = false;
+
+// BLE connection state -- also protected (NimBLE callbacks run in host task)
+static portMUX_TYPE bleLock = portMUX_INITIALIZER_UNLOCKED;
+static bool bleConnected = false;
+static bool needStateSync = false;
 
 #define C_BG    0x0000
 #define C_TEXT  0xFFFF
@@ -86,36 +108,28 @@ static const char* TPMS_MAC[4] = {
 #define C_RED   0xFAC9
 #define C_MUTED 0x7C32
 #define C_PANEL 0x18E3
-#define C_TPMSBG 0x02D6   // has-TPMS-data wheel background (teal/blue)
+#define C_TPMSBG 0x02D6
 
 Arduino_DataBus* bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX* gfx = new Arduino_GC9A01(bus, LCD_RST, 1, true);
-
-// MAX6675 uses SCK, CS, MISO(SDO)
 MAX6675 maxtc(PIN_TC_SCK, PIN_TC_CS, PIN_TC_SDO);
 
 NimBLECharacteristic* chTemp = nullptr;
 NimBLECharacteristic* chState = nullptr;
 NimBLECharacteristic* chPress = nullptr;
-volatile float tpmsPsi[4]      = {NAN, NAN, NAN, NAN};   // LF,RF,LR,RR
-volatile float tpmsTempC[4]    = {NAN, NAN, NAN, NAN};
-volatile uint32_t tpmsLastMs[4]= {0, 0, 0, 0};
-volatile bool pressDirty = false;
-volatile bool bleConnected = false;
-volatile bool needStateSync = false;
 
 const char* TIRE_SHORT[4] = {"LF", "RF", "LR", "RR"};
 const char* TIRE_LONG[4]  = {"LEFT FRONT", "RIGHT FRONT", "LEFT REAR", "RIGHT REAR"};
 const char* SLOT[3] = {"O", "M", "I"};
 
-float temps[4][3];        // degC, NAN = empty
+float temps[4][3];
 int selTire = -1;
 enum Mode { SELECT, RECORD };
 Mode mode = SELECT;
 
 float lastTempC = NAN;
 uint8_t lastFault = 0;
-bool tcOk = true; // Assumed true for MAX6675, connection verified via NAN outputs
+bool tcOk = true;
 float battV = 0;
 int battPct = 0;
 bool charging = false;
@@ -126,8 +140,6 @@ bool lastCharging = false;
 bool dirty = true;
 int lastShownTemp = -9999;
 unsigned long lastTempMs = 0, lastBatMs = 0;
-
-// touch edge detect
 bool touchWasDown = false;
 
 // ---------- buzzer ----------
@@ -165,20 +177,39 @@ static void serviceBuzzer() {
 }
 
 class ServerCb : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override { 
-    bleConnected = true; 
-    needStateSync = true; 
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    portENTER_CRITICAL(&bleLock);
+    bleConnected = true;
+    needStateSync = true;
+    portEXIT_CRITICAL(&bleLock);
   }
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override { 
-    bleConnected = false; 
-    NimBLEDevice::startAdvertising(); 
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    portENTER_CRITICAL(&bleLock);
+    bleConnected = false;
+    portEXIT_CRITICAL(&bleLock);
+    NimBLEDevice::startAdvertising();
   }
 };
+
+static bool bleIsConnected() {
+  portENTER_CRITICAL(&bleLock);
+  bool c = bleConnected;
+  portEXIT_CRITICAL(&bleLock);
+  return c;
+}
+
+static bool bleConsumeStateSync() {
+  portENTER_CRITICAL(&bleLock);
+  bool s = needStateSync;
+  needStateSync = false;
+  portEXIT_CRITICAL(&bleLock);
+  return s;
+}
 
 static void sendTemp(float tC, uint8_t fault) {
 #if ENABLE_BLE
   uint8_t buf[5]; memcpy(buf, &tC, 4); buf[4] = fault;
-  chTemp->setValue(buf, 5); if (bleConnected) chTemp->notify();
+  chTemp->setValue(buf, 5); if (bleIsConnected()) chTemp->notify();
 #endif
 }
 static void notifyState() {
@@ -190,13 +221,57 @@ static void notifyState() {
     int16_t v = isnan(c) ? (int16_t)-32768 : (int16_t)lroundf(c * 10.0f);
     buf[idx] = v & 0xFF; buf[idx + 1] = (v >> 8) & 0xFF;
   }
-  chState->setValue(buf, 24); if (bleConnected) chState->notify();
+  chState->setValue(buf, 24); if (bleIsConnected()) chState->notify();
 #endif
 }
 
-// ---------- TPMS (BLE scan of generic wheel sensors) ----------
+// ---------- Tesla TPMS decoder ----------
+// Payload structure after 0x2B 0x02 marker:
+//   [0x2B] [0x02] [?] [?] [type] [press_lo] [press_hi] [temp] [batt_lo] [batt_hi]
+//   type < 0x05 -> SLEEP MODE (no pressure/temp data)
+//   pressure: ((uint16 LE) - 100) / 7 = PSI
+//   temperature: uint8 - 1 = degF
+// Ref: cunzulatu/Tesla_BLE_TPMS (MIT)
+static int findTeslaPayload(const uint8_t* d, size_t n) {
+  for (size_t i = 0; i + 10 <= n; i++) {
+    if (d[i] == 0x2B && d[i + 1] == 0x02) return (int)i;
+  }
+  return -1;
+}
+
+static bool decodeTeslaTpms(const uint8_t* d, size_t n, float& psi, float& tempC) {
+  int idx = findTeslaPayload(d, n);
+  if (idx < 0 || idx + 10 > (int)n) return false;
+
+  uint8_t type = d[idx + 4];
+  if (type < 0x05) return false;  // sensor in sleep mode -- no data
+
+  uint16_t rawP = (uint16_t)d[idx + 5] | ((uint16_t)d[idx + 6] << 8);
+  uint8_t  rawT = d[idx + 7];
+
+  psi   = ((float)rawP - 100.0f) / 7.0f;
+  tempC = ((float)(rawT - 1) - 32.0f) * 5.0f / 9.0f;  // degF -> degC
+
+  // Sanity gate -- track-range thresholds
+  if (psi < 0 || psi > 150 || tempC < -40 || tempC > 200) return false;
+  return true;
+}
+
+// Thread-safe write -- call ONLY from NimBLE scan callback (different task)
+static void tpmsWrite(int w, float psi, float tempC) {
+  portENTER_CRITICAL(&tpmsLock);
+  tpmsPsi[w]    = psi;
+  tpmsTempC[w]  = tempC;
+  tpmsLastMs[w] = millis();
+  pressDirty    = true;
+  portEXIT_CRITICAL(&tpmsLock);
+}
+
 static inline bool hasTpms(int w) {
-  return tpmsLastMs[w] != 0 && (millis() - tpmsLastMs[w]) < TPMS_STALE_MS;
+  portENTER_CRITICAL(&tpmsLock);
+  bool ok = tpmsLastMs[w] != 0 && (millis() - tpmsLastMs[w]) < TPMS_STALE_MS;
+  portEXIT_CRITICAL(&tpmsLock);
+  return ok;
 }
 
 static int wheelForAddr(const std::string& addr) {
@@ -204,26 +279,22 @@ static int wheelForAddr(const std::string& addr) {
   return -1;
 }
 
-// Decode PSI + degC from a sensor's advertising manufacturer data.
-// *** ADJUST to match your sensor *** — run SCAN_DUMP, capture a sample, map the bytes.
-// Default below matches the common cheap "BLE TPMS": [00 01][6-byte id][status]
-// [pressure u32 LE = Pa][temp i32 LE = 0.01 degC][batt][alarm].
-static bool decodeTpms(const uint8_t* d, size_t n, float& psi, float& tempC) {
-  if (n < 18) return false;
-  uint32_t pa  = (uint32_t)d[8]  | ((uint32_t)d[9] << 8)  | ((uint32_t)d[10] << 16) | ((uint32_t)d[11] << 24);
-  int32_t  tcc = (int32_t)((uint32_t)d[12] | ((uint32_t)d[13] << 8) | ((uint32_t)d[14] << 16) | ((uint32_t)d[15] << 24));
-  psi   = pa * 0.000145038f;   // Pa -> psi
-  tempC = tcc / 100.0f;        // 0.01 degC -> degC
-  if (psi < 0 || psi > 120 || tempC < -40 || tempC > 150) return false;  // sanity gate
-  return true;
+static bool tpmsConsumeDirty() {
+  portENTER_CRITICAL(&tpmsLock);
+  bool d = pressDirty;
+  pressDirty = false;
+  portEXIT_CRITICAL(&tpmsLock);
+  return d;
 }
 
 static void notifyPressures() {
 #if ENABLE_BLE
   uint8_t buf[32];
+  portENTER_CRITICAL(&tpmsLock);
   for (int w = 0; w < 4; w++) { float p = tpmsPsi[w];   memcpy(buf + w * 4,      &p, 4); }
   for (int w = 0; w < 4; w++) { float t = tpmsTempC[w]; memcpy(buf + 16 + w * 4, &t, 4); }
-  chPress->setValue(buf, 32); if (bleConnected) chPress->notify();
+  portEXIT_CRITICAL(&tpmsLock);
+  chPress->setValue(buf, 32); if (bleIsConnected()) chPress->notify();
 #endif
 }
 
@@ -235,14 +306,18 @@ class ScanCb : public NimBLEScanCallbacks {
 #if SCAN_DUMP
     Serial.printf("ADV %s rssi=%d name=%s mfg=", addr.c_str(), dev->getRSSI(), dev->getName().c_str());
     for (size_t i = 0; i < md.size(); i++) Serial.printf("%02x", (uint8_t)md[i]);
+    int teslaIdx = findTeslaPayload((const uint8_t*)md.data(), md.size());
+    if (teslaIdx >= 0) {
+      uint8_t type = (uint8_t)md[teslaIdx + 4];
+      Serial.printf("  [TESLA type=0x%02x %s]", type, type < 0x05 ? "SLEEP" : "ACTIVE");
+    }
     Serial.println();
 #endif
     int w = wheelForAddr(addr);
     if (w < 0) return;
     float psi, tc;
-    if (decodeTpms((const uint8_t*)md.data(), md.size(), psi, tc)) {
-      tpmsPsi[w] = psi; tpmsTempC[w] = tc; tpmsLastMs[w] = millis();
-      pressDirty = true;
+    if (decodeTeslaTpms((const uint8_t*)md.data(), md.size(), psi, tc)) {
+      tpmsWrite(w, psi, tc);
     }
   }
 };
@@ -289,7 +364,7 @@ static void doRecord() {
       return;
     }
   }
-  beep(2, 50, 70);   // tire already full
+  beep(2, 50, 70);
 }
 static void doClear() {
   if (selTire < 0) return;
@@ -309,10 +384,9 @@ static void textIn(const char* s, int cx, int cy, uint8_t size, uint16_t color) 
   gfx->setCursor(cx - w / 2, cy - h / 2); gfx->print(s);
 }
 
-// ---------- battery ----------
 static int batteryPercent(float v) {
   static const float vs[] = {3.30f,3.50f,3.60f,3.70f,3.75f,3.80f,3.85f,3.90f,3.95f,4.00f,4.10f,4.20f};
-  static const int   ps[] = {0,    5,    10,   20,   30,   40,   50,   60,   70,   80,   92,   100};
+  static const int   ps[] = {0,5,10,20,30,40,50,60,70,80,92,100};
   if (v <= vs[0]) return 0;
   if (v >= vs[11]) return 100;
   for (int i = 0; i < 11; i++) {
@@ -326,35 +400,33 @@ static int batteryPercent(float v) {
 
 static bool chargingDetect(float v) {
 #if (PIN_CHRG >= 0)
-  (void)v; return digitalRead(PIN_CHRG) == LOW;     // open-drain CHRG: low = charging
+  (void)v; return digitalRead(PIN_CHRG) == LOW;
 #else
-  static bool ch = false;                            // voltage heuristic + hysteresis
+  static bool ch = false;
   if (v >= CHG_V_THRESH) ch = true;
   else if (v < CHG_V_THRESH - 0.10f) ch = false;
   return ch;
 #endif
 }
 
-// Android-style battery glyph at top (right-biased): icon + %, green w/ bolt when charging.
 static void drawBattery() {
   uint16_t col = charging ? C_GREEN
                : (battPct <= 15 ? C_RED : (battPct <= 40 ? C_AMBER : C_TEXT));
-  gfx->fillRect(100, 10, 60, 18, C_BG);              // clear cluster region
+  gfx->fillRect(100, 10, 60, 18, C_BG);
   char p[6]; snprintf(p, sizeof(p), "%d%%", battPct);
   int w = (int)strlen(p) * 6;
   gfx->setTextSize(1); gfx->setTextColor(col);
-  gfx->setCursor(130 - w, 14); gfx->print(p);        // % right-aligned to x=130
-  gfx->drawRect(134, 12, 22, 12, col);               // body
-  gfx->fillRect(156, 15, 2, 6, col);                 // terminal nub
+  gfx->setCursor(130 - w, 14); gfx->print(p);
+  gfx->drawRect(134, 12, 22, 12, col);
+  gfx->fillRect(156, 15, 2, 6, col);
   int fw = (int)(battPct / 100.0f * 18);
-  if (fw > 0) gfx->fillRect(136, 14, fw, 8, col);    // fill
-  if (charging) {                                    // lightning bolt
+  if (fw > 0) gfx->fillRect(136, 14, fw, 8, col);
+  if (charging) {
     gfx->fillTriangle(146, 11, 141, 19, 147, 19, C_TEXT);
     gfx->fillTriangle(145, 25, 150, 17, 144, 17, C_TEXT);
   }
 }
 
-// RECORD-screen slot geometry
 static const int SLOT_Y = 54, SLOT_H = 64, SLOT_W = 58;
 static const int SLOT_X[3] = {25, 91, 157};
 
@@ -363,7 +435,7 @@ static void drawSlot(int s, int nextEmpty) {
   bool filled = !isnan(temps[selTire][s]);
   bool isNext = (s == nextEmpty);
   uint16_t border = filled ? C_GREEN : (isNext ? C_RED : C_MUTED);
-  gfx->fillRect(bx + 2, by + 2, bw - 4, bh - 4, C_BG); 
+  gfx->fillRect(bx + 2, by + 2, bw - 4, bh - 4, C_BG);
   gfx->drawRoundRect(bx, by, bw, bh, 8, border);
   textIn(SLOT[s], bx + bw / 2, by + 14, 1, C_MUTED);
   char v[6]; uint16_t vc;
@@ -388,11 +460,18 @@ static void drawSelect() {
   for (int t = 0; t < 4; t++) {
     int n = filledCount(t);
     uint16_t border = (n == 3) ? C_GREEN : (n > 0 ? C_AMBER : C_MUTED);
-    bool tp = hasTpms(t);
+
+    // thread-safe TPMS read
+    float pPsi; uint32_t pLast;
+    portENTER_CRITICAL(&tpmsLock);
+    pPsi = tpmsPsi[t]; pLast = tpmsLastMs[t];
+    portEXIT_CRITICAL(&tpmsLock);
+    bool tp = pLast != 0 && (millis() - pLast) < TPMS_STALE_MS;
+
     gfx->fillRoundRect(bx[t], by[t], 72, 72, 10, tp ? C_TPMSBG : C_PANEL);
     gfx->drawRoundRect(bx[t], by[t], 72, 72, 10, border);
-    if (tp && !isnan(tpmsPsi[t])) {
-      char p[8]; snprintf(p, sizeof(p), "%dp", (int)lroundf(tpmsPsi[t]));
+    if (tp && !isnan(pPsi)) {
+      char p[8]; snprintf(p, sizeof(p), "%dp", (int)lroundf(pPsi));
       textIn(p, bx[t] + 36, by[t] + 11, 1, C_TEXT);
     }
     textIn(TIRE_SHORT[t], bx[t] + 36, by[t] + 30, 3, C_TEXT);
@@ -413,7 +492,7 @@ static void drawRecord() {
 
   gfx->fillRoundRect(26, 124, 188, 56, 12, C_AMBER);
   textIn("RECORD", 120, 152, 4, 0x1A03);
-  
+
   gfx->drawRoundRect(46, 186, 68, 22, 6, C_RED);
   textIn("CLEAR", 80, 197, 2, C_RED);
   gfx->drawRoundRect(126, 186, 68, 22, 6, C_MUTED);
@@ -423,9 +502,7 @@ static void drawRecord() {
 static void redraw() { if (mode == SELECT) drawSelect(); else drawRecord(); }
 
 static void updateTempRegion() {
-  if (mode == SELECT) {
-    // nothing live to repaint on SELECT (battery handled separately)
-  } else {
+  if (mode != SELECT) {
     int nextEmpty = -1;
     for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
     if (nextEmpty >= 0) drawSlot(nextEmpty, nextEmpty);
@@ -434,10 +511,10 @@ static void updateTempRegion() {
 
 static void handleTap(int x, int y) {
   if (mode == SELECT) {
-    if (inRect(x, y, 40, 40, 72, 72)) { selTire = 0; mode = RECORD; dirty = true; }
+    if (inRect(x, y, 40, 40, 72, 72))      { selTire = 0; mode = RECORD; dirty = true; }
     else if (inRect(x, y, 128, 40, 72, 72)) { selTire = 1; mode = RECORD; dirty = true; }
     else if (inRect(x, y, 40, 128, 72, 72)) { selTire = 2; mode = RECORD; dirty = true; }
-    else if (inRect(x, y, 128, 128, 72, 72)) { selTire = 3; mode = RECORD; dirty = true; }
+    else if (inRect(x, y, 128, 128, 72, 72)){ selTire = 3; mode = RECORD; dirty = true; }
   } else {
     if (inRect(x, y, 26, 124, 188, 56)) doRecord();
     else if (inRect(x, y, 46, 186, 68, 22)) doClear();
@@ -485,17 +562,16 @@ void setup() {
   adv->enableScanResponse(true);
   adv->start();
 
-  // Observer: continuously scan for the wheel TPMS sensors while still advertising.
   static ScanCb scanCb;
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&scanCb, false);
   scan->setActiveScan(true);
-  scan->setInterval(160);            // 0.625ms units (~100ms)
+  scan->setInterval(160);
   scan->setWindow(160);
-  scan->setDuplicateFilter(false);   // keep hearing each sensor to refresh freshness
-  scan->start(0, false);             // 0 = scan continuously
-  notifyPressures();                 // seed PRESS read value (all NaN until sensors heard)
-  Serial.println("PyroTC ready, advertising + TPMS scan.");
+  scan->setDuplicateFilter(false);
+  scan->start(0, false);
+  notifyPressures();
+  Serial.println("PyroTC ready, advertising + Tesla TPMS scan.");
 #else
   Serial.println("PyroTC ready, BLE DISABLED (isolation build).");
 #endif
@@ -505,14 +581,13 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // MAX6675 takes ~220ms for a conversion. Polling at 250ms prevents garbage reads.
   if (now - lastTempMs >= 250) {
     lastTempMs = now;
     lastTempC = maxtc.readCelsius();
     lastFault = isnan(lastTempC) ? 1 : 0;
     sendTemp(isnan(lastTempC) ? -1000.0f : lastTempC, lastFault);
   }
-  
+
   if (now - lastBatMs >= 2000) {
     lastBatMs = now;
     battV = 3.3f / 4096.0f * 3.0f * analogRead(PIN_BAT);
@@ -524,10 +599,10 @@ void loop() {
       lastBattPct = battPct; lastCharging = charging;
     }
   }
-  if (needStateSync) { needStateSync = false; notifyState(); }
-  if (pressDirty) { pressDirty = false; notifyPressures(); }
 
-  // repaint SELECT when a wheel gains TPMS data or it goes stale
+  if (bleConsumeStateSync()) notifyState();
+  if (tpmsConsumeDirty()) notifyPressures();
+
   static uint8_t lastTpmsMask = 0xFF;
   uint8_t tmask = 0;
   for (int w = 0; w < 4; w++) if (hasTpms(w)) tmask |= (1 << w);

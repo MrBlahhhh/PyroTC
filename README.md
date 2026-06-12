@@ -15,25 +15,24 @@ Weight app over BLE so cells fill live. No hardwired trigger.
 
 ## Bill of materials
 - Waveshare **ESP32-S3-Touch-LCD-1.28** (GC9A01 + CST816S touch) — you have it
-- Adafruit **MAX31856** (K-type, SPI) + your K-type probe
+- **MAX6675** (K-type, SPI read-only) + your K-type probe
 - Active buzzer (or bare piezo — set `BUZZER_ACTIVE 0`)
 - 3.7V LiPo on the MX1.25 connector (optional)
 
-## Wiring — only 5 wires + power (no button anymore)
+## Wiring — only 4 wires + power (MAX6675 is read-only, no MOSI needed)
 Display, touch+IMU (I2C 6/7), TP_RST(13), backlight(2), battery(1), USB-UART(43/44)
 are already on the board.
 
-| MAX31856 | ESP32-S3 |
-|----------|----------|
-| SCK | GPIO15 |
-| SDI | GPIO16 |
-| SDO | GPIO17 |
-| CS  | GPIO18 |
-| VIN | 3V3 |
-| GND | GND |
-| T+/T− | K-type probe (yellow +, red −) |
+| MAX6675 | ESP32-S3 |
+|---------|----------|
+| SCK     | GPIO15   |
+| SDO     | GPIO17   |
+| CS      | GPIO18   |
+| VIN     | 3V3      |
+| GND     | GND      |
+| T+/T−   | K-type probe (yellow +, red −) |
 
-Buzzer: GPIO33 → (+), (−) → GND. (GPIO21 is now free/unused.)
+Buzzer: GPIO33 → (+), (−) → GND. GPIO16 is free/unused (no SDI line needed).
 
 ## Build / flash (PlatformIO)
 Flashes over the CH343P USB-UART; plain Serial works.
