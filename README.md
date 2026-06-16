@@ -1,4 +1,3 @@
-
 # PyroTC — touchscreen BLE tire pyrometer (Waveshare ESP32-S3-Touch-LCD-1.28)
 
 Standalone handheld K-type pyrometer. You pick the tire and record readings on the
@@ -16,30 +15,25 @@ Weight app over BLE so cells fill live. No hardwired trigger.
 
 ## Bill of materials
 - Waveshare **ESP32-S3-Touch-LCD-1.28** (GC9A01 + CST816S touch) — you have it
-- **MAX6675** (K-type, SPI read-only) + your K-type probe
+- Adafruit **MAX31856** (K-type, SPI) + your K-type probe
 - Active buzzer (or bare piezo — set `BUZZER_ACTIVE 0`)
 - 3.7V LiPo on the MX1.25 connector (optional)
 
-## Wiring — 6 wires + probe (MAX6675 is read-only, no MOSI needed)
+## Wiring — only 5 wires + power (no button anymore)
 Display, touch+IMU (I2C 6/7), TP_RST(13), backlight(2), battery(1), USB-UART(43/44)
 are already on the board.
 
-| Wire     | MAX6675 | ESP32-S3 |
-|----------|---------|----------|
-| yellow   | SCK     | GPIO15   |
-| blue     | SDO     | GPIO17   |
-| green    | CS      | GPIO18   |
-| red      | VIN     | 3V3      |
-| black    | GND (1) | GND      |
-| black    | GND (5) | GND      |
-| —        | T+/T−   | K-type probe (yellow +, red −) |
+| MAX31856 | ESP32-S3 |
+|----------|----------|
+| SCK | GPIO15 |
+| SDI | GPIO16 |
+| SDO | GPIO17 |
+| CS  | GPIO18 |
+| VIN | 3V3 |
+| GND | GND |
+| T+/T− | K-type probe (yellow +, red −) |
 
-| Wire     | Buzzer    | ESP32-S3 |
-|----------|-----------|----------|
-| white    | (+)       | GPIO33   |
-| —        | (−)       | GND      |
-
-GPIO16 is free/unused (no SDI line needed).
+Buzzer: GPIO33 → (+), (−) → GND. (GPIO21 is now free/unused.)
 
 ## Build / flash (PlatformIO)
 Flashes over the CH343P USB-UART; plain Serial works.
