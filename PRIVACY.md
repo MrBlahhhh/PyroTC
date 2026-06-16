@@ -94,4 +94,4 @@ We may update this policy from time to time. Material changes will be reflected 
 
 ## Contact
 
-Questions about this policy can be sent to: **[FILL IN CONTACT EMAIL]**
+Questions about this policy can be sent to: matt@geekopolis.com
