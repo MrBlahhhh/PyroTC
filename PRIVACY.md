@@ -1,9 +1,9 @@
 # Privacy Policy — Trackday Pyrometer Helper
 
-**Effective date:** [FILL IN DATE, e.g. June 15, 2026]
+**Effective date:**  June 15, 2026
 **App:** Trackday Pyrometer Helper (Android)
-**Developer:** [FILL IN YOUR NAME OR STUDIO NAME] ("we", "us")
-**Contact:** [FILL IN CONTACT EMAIL]
+**Developer:** Matthew Ryan
+**Contact:** matt@geekopolis.com
 
 This policy explains what Trackday Pyrometer Helper (the "App") does with information. Please read it alongside the App's Google Play "Data safety" section.
 
