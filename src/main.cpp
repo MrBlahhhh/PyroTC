@@ -281,7 +281,7 @@ static void drawBattery() {
 }
 
 // RECORD-screen slot geometry
-static const int SLOT_Y = 54, SLOT_H = 64, SLOT_W = 58;
+static const int SLOT_Y = 48, SLOT_H = 64, SLOT_W = 58;
 static const int SLOT_X[3] = {25, 91, 157};
 
 static void drawSlot(int s, int nextEmpty) {
@@ -291,7 +291,7 @@ static void drawSlot(int s, int nextEmpty) {
   uint16_t border = filled ? C_GREEN : (isNext ? C_RED : C_MUTED);
   gfx->fillRect(bx + 2, by + 2, bw - 4, bh - 4, C_BG); 
   gfx->drawRoundRect(bx, by, bw, bh, 8, border);
-  textIn(SLOT[s], bx + bw / 2, by + 14, 1, C_MUTED);
+  textIn(SLOT[s], bx + bw / 2, by + 15, 2, C_MUTED);
   char v[6]; uint16_t vc;
   if (filled) {
     snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(temps[selTire][s]))); vc = C_GREEN;
@@ -306,25 +306,24 @@ static void drawSlot(int s, int nextEmpty) {
 
 static void drawSelect() {
   gfx->fillScreen(C_BG);
-  gfx->drawCircle(120, 120, 116, C_MUTED);
   drawBattery();
 
-  const int bx[4] = {40, 128, 40, 128};
-  const int by[4] = {40, 40, 128, 128};
+  // four corner tiles pushed out to the round panel's rim, ~4px centre gap
+  const int bx[4] = {32, 122, 32, 122};
+  const int by[4] = {32, 32, 122, 122};
   for (int t = 0; t < 4; t++) {
     int n = filledCount(t);
     uint16_t border = (n == 3) ? C_GREEN : (n > 0 ? C_AMBER : C_MUTED);
-    gfx->fillRoundRect(bx[t], by[t], 72, 72, 10, C_PANEL);
-    gfx->drawRoundRect(bx[t], by[t], 72, 72, 10, border);
-    textIn(TIRE_SHORT[t], bx[t] + 36, by[t] + 30, 3, C_TEXT);
+    gfx->fillRoundRect(bx[t], by[t], 86, 86, 10, C_PANEL);
+    gfx->drawRoundRect(bx[t], by[t], 86, 86, 10, border);
+    textIn(TIRE_SHORT[t], bx[t] + 43, by[t] + 37, 3, C_TEXT);
     char c[6]; snprintf(c, sizeof(c), "%d/3", n);
-    textIn(c, bx[t] + 36, by[t] + 54, 2, border);
+    textIn(c, bx[t] + 43, by[t] + 62, 2, border);
   }
 }
 
 static void drawRecord() {
   gfx->fillScreen(C_BG);
-  gfx->drawCircle(120, 120, 116, C_MUTED);
   drawBattery();
   centerText(TIRE_LONG[selTire], 32, 2, C_AMBER);
 
@@ -332,13 +331,22 @@ static void drawRecord() {
   for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
   for (int s = 0; s < 3; s++) drawSlot(s, nextEmpty);
 
-  gfx->fillRoundRect(26, 124, 188, 56, 12, C_AMBER);
-  textIn("RECORD", 120, 152, 4, 0x1A03);
-  
-  gfx->drawRoundRect(46, 186, 68, 22, 6, C_RED);
-  textIn("CLEAR", 80, 197, 2, C_RED);
-  gfx->drawRoundRect(126, 186, 68, 22, 6, C_MUTED);
-  textIn("BACK", 160, 197, 2, C_MUTED);
+  // CLEAR / BACK as ring-segment wedges hugging the lower rim, split at the
+  // vertical centre so they meet in the middle. The inner radius keeps them
+  // clear of the RECORD bar; the trimmed angle span keeps them off its sides.
+  // (fillArc: 0=right, 90=down, 180=left, clockwise.)
+  const int16_t btnOut = 119, btnIn = 50;   // outer reaches the round panel's rim
+  gfx->fillArc(120, 120, btnOut, btnIn, 92, 152, C_PANEL);   // CLEAR (lower-left)
+  gfx->drawArc(120, 120, btnOut, btnIn, 92, 152, C_RED);
+  gfx->fillArc(120, 120, btnOut, btnIn, 28, 88, C_PANEL);    // BACK  (lower-right)
+  gfx->drawArc(120, 120, btnOut, btnIn, 28, 88, C_MUTED);
+
+  // RECORD: tall, near full-width bar across the middle.
+  gfx->fillRoundRect(12, 114, 216, 56, 14, C_AMBER);
+  textIn("RECORD", 120, 142, 4, 0x1A03);
+
+  textIn("CLEAR", 75, 200, 2, C_RED);
+  textIn("BACK", 165, 200, 2, C_MUTED);
 }
 
 static void redraw() { if (mode == SELECT) drawSelect(); else drawRecord(); }
@@ -355,14 +363,14 @@ static void updateTempRegion() {
 
 static void handleTap(int x, int y) {
   if (mode == SELECT) {
-    if (inRect(x, y, 40, 40, 72, 72)) { selTire = 0; mode = RECORD; dirty = true; }
-    else if (inRect(x, y, 128, 40, 72, 72)) { selTire = 1; mode = RECORD; dirty = true; }
-    else if (inRect(x, y, 40, 128, 72, 72)) { selTire = 2; mode = RECORD; dirty = true; }
-    else if (inRect(x, y, 128, 128, 72, 72)) { selTire = 3; mode = RECORD; dirty = true; }
+    if (inRect(x, y, 32, 32, 86, 86)) { selTire = 0; mode = RECORD; dirty = true; }
+    else if (inRect(x, y, 122, 32, 86, 86)) { selTire = 1; mode = RECORD; dirty = true; }
+    else if (inRect(x, y, 32, 122, 86, 86)) { selTire = 2; mode = RECORD; dirty = true; }
+    else if (inRect(x, y, 122, 122, 86, 86)) { selTire = 3; mode = RECORD; dirty = true; }
   } else {
-    if (inRect(x, y, 26, 124, 188, 56)) doRecord();
-    else if (inRect(x, y, 46, 186, 68, 22)) doClear();
-    else if (inRect(x, y, 126, 186, 68, 22)) { mode = SELECT; dirty = true; }
+    if (inRect(x, y, 12, 114, 216, 56)) doRecord();
+    else if (inRect(x, y, 0, 170, 120, 70)) doClear();                          // entire lower-left wedge
+    else if (inRect(x, y, 120, 170, 120, 70)) { mode = SELECT; dirty = true; }  // entire lower-right wedge
   }
 }
 
