@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# pioarduino from-source / custom_sdkconfig build artifacts (not part of the project)
+.dummy/
+CMakeLists.txt
+dependencies.lock
+managed_components/
+sdkconfig.defaults
+sdkconfig.*

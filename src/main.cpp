@@ -237,8 +237,9 @@ static void textIn(const char* s, int cx, int cy, uint8_t size, uint16_t color) 
 
 // ---------- battery ----------
 static int batteryPercent(float v) {
-  static const float vs[] = {3.30f,3.50f,3.60f,3.70f,3.75f,3.80f,3.85f,3.90f,3.95f,4.00f,4.10f,4.20f};
-  static const int   ps[] = {0,    5,    10,   20,   30,   40,   50,   60,   70,   80,   92,   100};
+  // Resting OCV -> SoC for a single Li-ion (18650) cell, lightly loaded.
+  static const float vs[] = {3.30f,3.45f,3.55f,3.66f,3.70f,3.74f,3.78f,3.82f,3.87f,3.95f,4.08f,4.20f};
+  static const int   ps[] = {0,    5,    10,   20,   30,   40,   50,   60,   70,   80,   90,   100};
   if (v <= vs[0]) return 0;
   if (v >= vs[11]) return 100;
   for (int i = 0; i < 11; i++) {
@@ -254,9 +255,17 @@ static bool chargingDetect(float v) {
 #if (PIN_CHRG >= 0)
   (void)v; return digitalRead(PIN_CHRG) == LOW;     // open-drain CHRG: low = charging
 #else
-  static bool ch = false;                            // voltage heuristic + hysteresis
-  if (v >= CHG_V_THRESH) ch = true;
-  else if (v < CHG_V_THRESH - 0.10f) ch = false;
+  // No charge-status line on this board, so infer charging from the pack
+  // voltage TREND: a charger pushes the voltage up (and holds it high near
+  // full); running on battery it drifts down. Compare the smoothed reading
+  // against a slow ~40 s baseline, with hysteresis so it doesn't flicker.
+  static bool ch = false;
+  static float slowV = 0.0f;
+  if (slowV <= 0.1f) { slowV = v; return false; }    // first sample
+  slowV += (v - slowV) * 0.05f;                       // slow baseline (~40 s)
+  float trend = v - slowV;
+  if (trend > 0.020f || v >= CHG_V_THRESH) ch = true; // rising, or topped off
+  else if (trend < -0.010f) ch = false;               // drifting down on battery
   return ch;
 #endif
 }
