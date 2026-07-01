@@ -95,7 +95,6 @@ Mode mode = SELECT;
 
 float lastTempC = NAN;
 uint8_t lastFault = 0;
-bool tcOk = true; // Assumed true for MAX6675, connection verified via NAN outputs
 float battV = 0;
 int battPct = 0;
 bool charging = false;
@@ -176,11 +175,16 @@ static void notifyState() {
 
 // ---------- touch (CST816S) ----------
 static bool readTouch(int& x, int& y) {
+  // Completed write-then-read transactions (no repeated start): the IDF5 "ng"
+  // I2C driver throws ESP_ERR_INVALID_STATE on the held-bus pattern when the
+  // chip naps. On any failure, back off so a sleeping chip can't spam errors.
+  static unsigned long backoffUntil = 0;
+  if (millis() < backoffUntil) return false;
   uint8_t buf[6];
   Wire.beginTransmission(CST816_ADDR);
   Wire.write(0x01);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(CST816_ADDR, 6) != 6) return false;
+  if (Wire.endTransmission(true) != 0) { backoffUntil = millis() + 500; return false; }
+  if (Wire.requestFrom(CST816_ADDR, 6) != 6) { backoffUntil = millis() + 500; return false; }
   for (int i = 0; i < 6; i++) buf[i] = Wire.read();
   if ((buf[1] & 0x0F) == 0) return false;
   int rx = ((buf[2] & 0x0F) << 8) | buf[3];
@@ -206,7 +210,7 @@ static int filledCount(int t) { int n = 0; for (int s = 0; s < 3; s++) if (!isna
 // ---------- actions ----------
 static void doRecord() {
   if (selTire < 0) return;
-  if (!tcOk || lastFault != 0 || isnan(lastTempC)) { beep(2, 50, 70); return; }
+  if (lastFault != 0 || isnan(lastTempC)) { beep(2, 50, 70); return; }
   for (int s = 0; s < 3; s++) {
     if (isnan(temps[selTire][s])) {
       temps[selTire][s] = lastTempC;
@@ -306,11 +310,24 @@ static void drawSlot(int s, int nextEmpty) {
     snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(temps[selTire][s]))); vc = C_GREEN;
   } else if (isNext) {
     vc = C_RED;
-    if (tcOk && lastFault == 0 && !isnan(lastTempC))
+    if (lastFault == 0 && !isnan(lastTempC))
       snprintf(v, sizeof(v), "%d", (int)lroundf(toShow(lastTempC)));
     else snprintf(v, sizeof(v), "--");
   } else { snprintf(v, sizeof(v), "--"); vc = C_MUTED; }
   textIn(v, bx + bw / 2, by + 42, 3, vc);
+}
+
+// Live probe temp on the right end of the RECORD bar — shown when the tire is
+// full, since no slot is displaying the live reading then.
+static void drawBarTemp() {
+  gfx->fillRect(192, 132, 36, 20, C_AMBER);
+  char v[6];
+  if (lastFault == 0 && !isnan(lastTempC)) {
+    int tv = (int)lroundf(toShow(lastTempC));
+    if (tv > 999) tv = 999; if (tv < -99) tv = -99;
+    snprintf(v, sizeof(v), "%d", tv);
+  } else snprintf(v, sizeof(v), "--");
+  textIn(v, 210, 142, 2, 0x1A03);
 }
 
 static void drawSelect() {
@@ -353,6 +370,7 @@ static void drawRecord() {
   // RECORD: tall, near full-width bar across the middle.
   gfx->fillRoundRect(12, 114, 216, 56, 14, C_AMBER);
   textIn("RECORD", 120, 142, 4, 0x1A03);
+  if (nextEmpty < 0) drawBarTemp();
 
   textIn("CLEAR", 75, 200, 2, C_RED);
   textIn("BACK", 165, 200, 2, C_MUTED);
@@ -367,6 +385,7 @@ static void updateTempRegion() {
     int nextEmpty = -1;
     for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
     if (nextEmpty >= 0) drawSlot(nextEmpty, nextEmpty);
+    else drawBarTemp();
   }
 }
 
@@ -377,6 +396,16 @@ static void handleTap(int x, int y) {
     else if (inRect(x, y, 32, 122, 86, 86)) { selTire = 2; mode = RECORD; dirty = true; }
     else if (inRect(x, y, 122, 122, 86, 86)) { selTire = 3; mode = RECORD; dirty = true; }
   } else {
+    // tap a filled O/M/I slot to clear just that reading
+    for (int s = 0; s < 3; s++) {
+      if (inRect(x, y, SLOT_X[s], SLOT_Y, SLOT_W, SLOT_H)) {
+        if (!isnan(temps[selTire][s])) {
+          temps[selTire][s] = NAN;
+          beep(1, 60, 0); notifyState(); dirty = true;
+        }
+        return;
+      }
+    }
     if (inRect(x, y, 12, 114, 216, 56)) doRecord();
     else if (inRect(x, y, 0, 170, 120, 70)) doClear();                          // entire lower-left wedge
     else if (inRect(x, y, 120, 170, 120, 70)) { mode = SELECT; dirty = true; }  // entire lower-right wedge
@@ -399,12 +428,17 @@ void setup() {
   digitalWrite(TP_RST, HIGH); delay(60);
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
+  // CST816S: disable auto-standby (reg 0xFE, DisAutoSleep) so it keeps ACKing;
+  // asleep it drops off the bus and touch dies until the next hard reset.
+  Wire.beginTransmission(CST816_ADDR);
+  Wire.write(0xFE); Wire.write(0x01);
+  Wire.endTransmission();
 
   gfx->begin();
   gfx->fillScreen(C_BG);
   centerText("PyroTC", 105, 4, C_AMBER);
 
-  battV = 3.3f / 4096.0f * 3.0f * analogRead(PIN_BAT);
+  battV = analogReadMilliVolts(PIN_BAT) * 3.0f / 1000.0f;   // eFuse-calibrated ADC
   emaV = battV; battPct = batteryPercent(emaV); charging = chargingDetect(emaV);
   lastBattPct = battPct; lastCharging = charging;
 
@@ -441,7 +475,7 @@ void loop() {
   
   if (now - lastBatMs >= 2000) {
     lastBatMs = now;
-    battV = 3.3f / 4096.0f * 3.0f * analogRead(PIN_BAT);
+    battV = analogReadMilliVolts(PIN_BAT) * 3.0f / 1000.0f;  // eFuse-calibrated ADC
     emaV = (emaV <= 0.1f) ? battV : (emaV * 0.7f + battV * 0.3f);
     battPct = batteryPercent(emaV);
     charging = chargingDetect(emaV);
@@ -459,7 +493,7 @@ void loop() {
 
   serviceBuzzer();
 
-  int shownTemp = (int)lroundf(toShow(lastTempC));
+  int shownTemp = isnan(lastTempC) ? -9999 : (int)lroundf(toShow(lastTempC));
   if (dirty) {
     redraw();
     dirty = false; lastShownTemp = shownTemp;

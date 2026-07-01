@@ -32,9 +32,13 @@ The Android app (`Trackday Pyrometer Helper`, `PyroSync.kt`) depends on these **
 
 If you must change the STATE layout, update `PyroSync.kt`'s parser in the app in lockstep and call it out explicitly.
 
-## TPMS was removed on purpose — do not re-add it
+## TPMS: LF wake-up planned (in progress)
 
-Tesla TPMS scanning/decoding (the old PRESS/SENS/MAP characteristics `…0004/0005/0006` and the BLE observer scan) was deliberately stripped from this firmware; that functionality now lives in the Android app. Do **not** reintroduce Tesla scanning, the runtime sensor map, or those characteristics here. PyroTC only advertises and serves temperatures.
+Tesla TPMS support is coming back. The plan: the device gets **125 kHz LF wake-up hardware** (external driver stage) to wake Continental/Tesla TPMS sensors with a **modulated data telegram** (pattern is being scoped/captured now — not yet final). Planned integration:
+
+- A **WAKE button** on the SELECT screen (bottom rim arc, `fillArc` style like RECORD's CLEAR/BACK).
+- Carrier/telegram via LEDC PWM on a free GPIO (16 or 21 pencilled in; avoid strapping pins 0/3/45/46). Non-blocking transmit, same state-machine style as the buzzer.
+- The old PRESS/SENS/MAP characteristics `…0004/0005/0006` were removed in an earlier cleanup and those UUIDs are currently free; if TPMS data flows through the device again, coordinate any new characteristics with the Android app (`PyroSync.kt`) in lockstep.
 
 ## Hard constraints
 
