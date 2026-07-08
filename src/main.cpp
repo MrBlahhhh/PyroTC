@@ -22,6 +22,7 @@
 #include <Arduino_GFX_Library.h>
 #include <max6675.h>
 #include <NimBLEDevice.h>
+#include "lf_wake.h"   // 125 kHz Continental TPMS LF wake (vendored from TpmsProbe-Tesla)
 
 // display (fixed)
 #define LCD_DC 8
@@ -72,6 +73,7 @@
 #define C_RED   0xFAC9
 #define C_MUTED 0x7C32
 #define C_PANEL 0x18E3
+#define C_WAKE  0x07FF   // cyan — TPMS LF wake accent
 
 Arduino_DataBus* bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX* gfx = new Arduino_GC9A01(bus, LCD_RST, 1, true);
@@ -357,26 +359,69 @@ static void drawRecord() {
   for (int s = 0; s < 3; s++) if (isnan(temps[selTire][s])) { nextEmpty = s; break; }
   for (int s = 0; s < 3; s++) drawSlot(s, nextEmpty);
 
-  // CLEAR / BACK as ring-segment wedges hugging the lower rim, split at the
-  // vertical centre so they meet in the middle. The inner radius keeps them
-  // clear of the RECORD bar; the trimmed angle span keeps them off its sides.
+  // Bottom rim: three ring-segment buttons — CLEAR (left), WAKE (centre),
+  // BACK (right). Inner radius keeps them clear of the RECORD bar.
   // (fillArc: 0=right, 90=down, 180=left, clockwise.)
   const int16_t btnOut = 119, btnIn = 50;   // outer reaches the round panel's rim
-  gfx->fillArc(120, 120, btnOut, btnIn, 92, 152, C_PANEL);   // CLEAR (lower-left)
-  gfx->drawArc(120, 120, btnOut, btnIn, 92, 152, C_RED);
-  gfx->fillArc(120, 120, btnOut, btnIn, 28, 88, C_PANEL);    // BACK  (lower-right)
-  gfx->drawArc(120, 120, btnOut, btnIn, 28, 88, C_MUTED);
+  gfx->fillArc(120, 120, btnOut, btnIn, 116, 160, C_PANEL);  // CLEAR (lower-left)
+  gfx->drawArc(120, 120, btnOut, btnIn, 116, 160, C_RED);
+  gfx->fillArc(120, 120, btnOut, btnIn,  72, 108, C_PANEL);  // WAKE  (bottom centre)
+  gfx->drawArc(120, 120, btnOut, btnIn,  72, 108, C_WAKE);
+  gfx->fillArc(120, 120, btnOut, btnIn,  20,  64, C_PANEL);  // BACK  (lower-right)
+  gfx->drawArc(120, 120, btnOut, btnIn,  20,  64, C_MUTED);
 
   // RECORD: tall, near full-width bar across the middle.
   gfx->fillRoundRect(12, 114, 216, 56, 14, C_AMBER);
   textIn("RECORD", 120, 142, 4, 0x1A03);
   if (nextEmpty < 0) drawBarTemp();
 
-  textIn("CLEAR", 75, 200, 2, C_RED);
-  textIn("BACK", 165, 200, 2, C_MUTED);
+  textIn("CLEAR", 52, 194, 2, C_RED);
+  textIn("WAKE", 120, 206, 2, C_WAKE);
+  textIn("BACK", 188, 194, 2, C_MUTED);
 }
 
 static void redraw() { if (mode == SELECT) drawSelect(); else drawRecord(); }
+
+// ---------- TPMS LF wake (125 kHz Continental) ----------
+// Fires a 10 s burst of the captured wake telegram. While bursting, loop()
+// does NOTHING else (no MAX6675 read, LCD, touch or serial) so the 128 us LF
+// bit grid isn't jittered. The buzzer is digitalWrite-based, so LEDC on the
+// coil pin doesn't clash with it.
+static const uint32_t WAKE_BURST_MS = 10000;
+static bool wakeActive = false;
+static uint32_t wakeEndMs = 0;
+
+static void drawWaking() {
+  gfx->fillScreen(C_BG);
+  centerText("WAKING", 92, 4, C_WAKE);
+  centerText(TIRE_LONG[selTire], 132, 2, C_AMBER);
+  centerText("hold coil at valve", 162, 1, C_MUTED);
+}
+
+static void startWakeBurst() {
+  if (wakeActive) return;                 // ignore re-press while bursting
+  wakeActive = true;
+  wakeEndMs = millis() + WAKE_BURST_MS;
+  drawWaking();
+  buzzerOn(); delay(80); buzzerOff();     // start chirp (blocking, before burst)
+}
+
+// Called every loop() iteration while a burst is active.
+static void serviceLfWake() {
+  if ((int32_t)(millis() - wakeEndMs) >= 0) {   // burst finished
+    lfWakeCarrierOff();
+    wakeActive = false;
+    dirty = true;                               // repaint RECORD screen
+    beep(1, 80, 0);                             // done chirp (plays once normal loop resumes)
+    return;
+  }
+  triggerContinentalWake();                      // ~23.6 ms telegram (busy-timed to grid)
+  uint32_t g = millis();                         // carrier-off gap; timing here not critical
+  while ((millis() - g) < LF_CONT_REPEAT_GAP_MS) {
+    if ((int32_t)(millis() - wakeEndMs) >= 0) break;
+    delay(1);                                     // yield so the task watchdog stays fed
+  }
+}
 
 static void updateTempRegion() {
   if (mode == SELECT) {
@@ -407,14 +452,16 @@ static void handleTap(int x, int y) {
       }
     }
     if (inRect(x, y, 12, 114, 216, 56)) doRecord();
-    else if (inRect(x, y, 0, 170, 120, 70)) doClear();                          // entire lower-left wedge
-    else if (inRect(x, y, 120, 170, 120, 70)) { mode = SELECT; dirty = true; }  // entire lower-right wedge
+    else if (inRect(x, y, 0, 170, 80, 70)) doClear();                           // lower-left  CLEAR
+    else if (inRect(x, y, 80, 170, 80, 70)) startWakeBurst();                   // bottom-centre WAKE
+    else if (inRect(x, y, 160, 170, 80, 70)) { mode = SELECT; dirty = true; }   // lower-right BACK
   }
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_BUZZER, OUTPUT); buzzerOff();
+  lfWakeInit(); lfWakeCarrierOff();          // 125 kHz LF coil driver (TPMS wake)
 #if (PIN_CHRG >= 0)
   pinMode(PIN_CHRG, INPUT_PULLUP);
 #endif
@@ -463,6 +510,10 @@ void setup() {
 }
 
 void loop() {
+  // While a TPMS wake burst is active, dedicate the loop to LF timing — skip
+  // the MAX6675 read, LCD, touch and BLE work that would jitter the bit grid.
+  if (wakeActive) { serviceLfWake(); return; }
+
   unsigned long now = millis();
 
   // MAX6675 takes ~220ms for a conversion. Polling at 250ms prevents garbage reads.

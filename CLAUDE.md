@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repo. Read before editing or building.
 
 `PyroTC` is the firmware for a **touchscreen BLE tire pyrometer**: a Waveshare ESP32-S3-Touch-LCD-1.28 (round GC9A01 LCD + CST816S touch) reading a MAX6675 K-type thermocouple, with a buzzer and battery indicator. The device owns all 12 tire readings (4 corners × OUT/MID/IN) and streams them over BLE to the companion Android app. It is the BLE **peripheral**; the app is the client.
 
-Single source file: `src/main.cpp` (~450 lines). Keep it single-file. The header comment at the top of `main.cpp` is authoritative for pinout and the BLE contract — trust it.
+Main source file: `src/main.cpp`. Keep the app logic single-file. The **exception** is the vendored LF-wake driver (`lf_wake.h/.cpp`, `cont_wake_data.h`) — see the TPMS section. The header comment at the top of `main.cpp` is authoritative for pinout and the BLE contract — trust it.
 
 ## Build, flash, monitor
 
@@ -32,13 +32,27 @@ The Android app (`Trackday Pyrometer Helper`, `PyroSync.kt`) depends on these **
 
 If you must change the STATE layout, update `PyroSync.kt`'s parser in the app in lockstep and call it out explicitly.
 
-## TPMS: LF wake-up planned (in progress)
+## TPMS: 125 kHz LF wake (implemented)
 
-Tesla TPMS support is coming back. The plan: the device gets **125 kHz LF wake-up hardware** (external driver stage) to wake Continental/Tesla TPMS sensors with a **modulated data telegram** (pattern is being scoped/captured now — not yet final). Planned integration:
+The device wakes Continental/Tesla TPMS sensors by replaying a captured **125 kHz OOK
+wake telegram** over an external coil driver (IRLZ44N low-side switch + EL-50448 coil +
+10 nF tank cap, on a separate 9 V domain — only GND shared with the ESP32).
 
-- A **WAKE button** on the SELECT screen (bottom rim arc, `fillArc` style like RECORD's CLEAR/BACK).
-- Carrier/telegram via LEDC PWM on a free GPIO (16 or 21 pencilled in; avoid strapping pins 0/3/45/46). Non-blocking transmit, same state-machine style as the buzzer.
-- The old PRESS/SENS/MAP characteristics `…0004/0005/0006` were removed in an earlier cleanup and those UUIDs are currently free; if TPMS data flows through the device again, coordinate any new characteristics with the Android app (`PyroSync.kt`) in lockstep.
+- **Driver is vendored** from the `TpmsProbe-Tesla` project: `src/lf_wake.{h,cpp}` +
+  the auto-generated `src/cont_wake_data.h` (184 uniform 128 µs half-bit slots, from an
+  Autel scope capture). Do **not** hand-edit `cont_wake_data.h`; regenerate it upstream
+  (`scripts/decode_scope_to_replay.py`) and re-copy all three files to re-sync.
+- **Coil pin: `LF_COIL_PIN = 4`** (set in `platformio.ini build_flags`). GPIO4 → 100 Ω →
+  MOSFET gate. Uses LEDC PWM; no clash with the digitalWrite buzzer.
+- **UI:** a **WAKE** button (cyan) sits centre of the RECORD screen's bottom rim, between
+  CLEAR (left) and BACK (right). Tapping it fires a **10 s burst** (`startWakeBurst`).
+- **Timing is exclusive:** while `wakeActive`, `loop()` runs *only* `serviceLfWake()` and
+  returns early — no MAX6675 read, LCD, touch, or BLE — because the ~220 ms thermocouple
+  read and LCD draws would jitter the 128 µs LF bit grid. The gap loop calls `delay(1)` so
+  the task watchdog stays fed. There is no mid-burst cancel (it auto-ends in 10 s).
+- The old PRESS/SENS/MAP characteristics `…0004/0005/0006` are free; the wake telegram is
+  one-way (no BLE), so no GATT change is needed. If TPMS *data* ever flows back through the
+  device, coordinate new characteristics with the Android app (`PyroSync.kt`) in lockstep.
 
 ## Hard constraints
 
@@ -66,4 +80,4 @@ Tesla TPMS support is coming back. The plan: the device gets **125 kHz LF wake-u
 ## Style & scope
 
 - Match the existing terse C-with-Arduino style; static functions, small helpers, comment blocks like the header.
-- This repo is **standalone**. The Android app and other sibling projects are separate — coordinate the BLE contract with them, but never pull their code in here.
+- This repo is **standalone** except for the vendored LF-wake driver (see the TPMS section). The Android app and other sibling projects are separate — coordinate the BLE contract with them, and don't pull other sibling code in here without an explicit, documented reason like the LF driver.
